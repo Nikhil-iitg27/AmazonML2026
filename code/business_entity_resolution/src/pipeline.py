@@ -23,6 +23,7 @@ import sys
 import time
 
 import numpy as np
+from tqdm.auto import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,6 +32,7 @@ from decide import macro_fbeta, resolve_exclusive, tune_threshold
 from features import N_FEATURES, RecordView, add_context, pair_features
 
 csv.field_size_limit(1 << 30)
+CHUNK = 20_000   # Source-1 entities scored per streamed batch
 LOG = lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
@@ -85,7 +87,8 @@ def build_candidates(s1_records, pool_records, n_threads=8):
     return out
 
 
-def featurise(candidates, s1_index, pool_index, truth=None):
+def featurise(candidates, s1_index, pool_index, truth=None,
+              view_cache=None, max_cache=300_000):
     """Build the design matrix. Returns (X, y, pair_keys).
 
     Pool records are cached: a popular record appears in many candidate lists,
@@ -93,11 +96,17 @@ def featurise(candidates, s1_index, pool_index, truth=None):
     dominated the runtime before this cache was added.
     """
     blocks, ys, keys = [], [], []
-    view_cache = {}
+    if view_cache is None:
+        view_cache = {}
 
     def view(rec_id, index):
         v = view_cache.get(rec_id)
         if v is None:
+            # Bounded, because at full scale an unbounded cache over a 5M-record
+            # pool is tens of gigabytes. Dropping it wholesale is fine: the cost
+            # is a recomputation, not a wrong answer.
+            if len(view_cache) >= max_cache:
+                view_cache.clear()
             v = view_cache[rec_id] = RecordView(*index[rec_id][1:3])
         return v
 
@@ -226,23 +235,61 @@ def cmd_predict(args):
     s1_index = {r[0]: r for r in s1}
     pool_index = {r[0]: r for r in pool}
 
-    LOG("blocking")
-    candidates = build_candidates(s1, pool, args.threads)
+    # Streamed, one country partition at a time and one entity chunk at a time.
+    # Holding the whole run in memory means a ~114M-row design matrix (~18 GB)
+    # plus a comparable candidate dict, which does not fit. Candidates stream
+    # straight to disk; only the final match lists (small) are kept.
+    os.makedirs(args.out, exist_ok=True)
+    cand_path = os.path.join(args.out, "candidate_pairs.tsv")
+    final = {}
+    n_cand = 0
 
-    # candidate_pairs.tsv is exactly what the model runs inference over.
-    write_id_lists(os.path.join(args.out, "candidate_pairs.tsv"),
-                   ["source1_entity_id", "candidate_entity_ids"],
-                   [(r[0], sorted(candidates.get(r[0], {}))) for r in s1])
-    LOG("wrote candidate_pairs.tsv")
+    q_by_country = group_by_country(s1)
+    p_by_country = group_by_country(pool)
 
-    LOG("featurising + scoring")
-    X, _, keys = featurise(candidates, s1_index, pool_index, truth=None)
-    probs = model.predict_proba(X)[:, 1] if len(X) else np.zeros(0)
-    scored = group_scores(keys, probs)
-    for r in s1:
-        scored.setdefault(r[0], [])
+    with open(cand_path, "w", encoding="utf-8", newline="") as cf:
+        cf.write("source1_entity_id\tcandidate_entity_ids\n")
 
-    final = resolve_exclusive(scored, thr)
+        for country, queries in q_by_country.items():
+            p = p_by_country.get(country, [])
+            if not p:
+                LOG(f"  {country}: {len(queries)} queries, empty pool")
+                for q in queries:
+                    cf.write(f"{q[0]}\t\n")
+                continue
+
+            t0 = time.time()
+            merged = block_partition(queries, p, args.threads, tag=country)
+            LOG(f"  {country}: blocked {len(queries)}q x {len(p)}pool "
+                f"({time.time() - t0:.0f}s)")
+
+            scored_part, view_cache = {}, {}
+            for lo in tqdm(range(0, len(queries), CHUNK),
+                           desc=f"  {country} score", unit="chunk"):
+                block = {}
+                for qi in range(lo, min(lo + CHUNK, len(queries))):
+                    cands = {p[pi][0]: sc for pi, sc in merged.get(qi, {}).items()}
+                    block[queries[qi][0]] = cands
+                    cf.write(f"{queries[qi][0]}\t{','.join(sorted(cands))}\n")
+                    n_cand += len(cands)
+
+                X, _, keys = featurise(block, s1_index, pool_index, truth=None,
+                                       view_cache=view_cache)
+                if not len(X):
+                    continue
+                probs = model.predict_proba(X)[:, 1]
+                for (s1_id, cid), pr in zip(keys, probs):
+                    if pr >= thr:                     # pre-filter: keeps this small
+                        scored_part.setdefault(s1_id, []).append((cid, float(pr)))
+
+            # Exclusivity only ever applies within a partition, because blocking
+            # never proposes a candidate across country boundaries.
+            for q in queries:
+                scored_part.setdefault(q[0], [])
+            final.update(resolve_exclusive(scored_part, thr))
+            del merged, scored_part, view_cache
+
+    LOG(f"wrote candidate_pairs.tsv ({n_cand} candidate pairs)")
     write_id_lists(os.path.join(args.out, "matching_results.tsv"),
                    ["source1_entity_id", "matched_entity_ids"],
                    [(r[0], final.get(r[0], [])) for r in s1])

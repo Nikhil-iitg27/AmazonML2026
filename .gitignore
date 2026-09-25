@@ -1,1 +1,7 @@
 .venv/
+dataset/
+docs/
+__pycache__/
+artifacts/
+output/
+*.pyc

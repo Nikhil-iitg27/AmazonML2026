@@ -1,0 +1,7 @@
+# Pinned to the versions the pipeline was developed and measured against.
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+rapidfuzz==3.14.6
+sparse-dot-topn==1.2.0
